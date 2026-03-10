@@ -25,7 +25,7 @@ import arc_agi
 from arc_agi import OperationMode
 
 from arcgym.agents import AVAILABLE_AGENTS
-from arcgym.agents.rgb_agent import RGBAgent
+from arcgym.evaluation.runner import GameRunner
 from arcgym.environments import ArcAgi3Env
 from arcgym.evaluation.config import EVALUATION_GAMES
 from arcgym.metrics.structures import GameMetrics, Status
@@ -103,7 +103,7 @@ class Swarm:
                 prompts_log_path = game_dir / "logs.txt"
                 prompts_log_path.write_text("")
 
-            agent = RGBAgent(
+            runner = GameRunner(
                 env=env,
                 game_id=game_id,
                 agent_name=self.inner_agent_kwargs.get("name", "swarm_agent"),
@@ -113,9 +113,9 @@ class Swarm:
                 analyzer=self.analyzer_hook,
                 log_post_board=self.log_post_board,
                 analyzer_retries=self.analyzer_retries,
-                inner_agent_kwargs=self.inner_agent_kwargs,
+                agent_kwargs=self.inner_agent_kwargs,
             )
-            metrics = agent.run()
+            metrics = runner.run()
 
             with self._lock:
                 self.results[game_id] = metrics
@@ -142,7 +142,7 @@ def main() -> None:
     logging.getLogger("arc_agi").propagate = False
 
     parser = argparse.ArgumentParser(description="Run ARC-AGI-3 Swarm evaluation.")
-    parser.add_argument("--agent", "-a", default="claude_code_action_agent",
+    parser.add_argument("--agent", "-a", default="rgb_agent",
                         choices=list(AVAILABLE_AGENTS.keys()))
     parser.add_argument("--game", "-g",
                         help="Comma-separated game IDs (e.g. ls20-cb3b57cc,ft09-9ab2447a).")
@@ -194,9 +194,9 @@ def main() -> None:
         operation_mode=OperationMode(args.operation_mode),
     )
 
-    from arcgym.utils.analyzer import make_opencode_analyzer
+    from arcgym.agents.rgb_agent import make_analyzer
 
-    analyzer_hook = make_opencode_analyzer(
+    analyzer_hook = make_analyzer(
         interval=0, use_subscription=False, allow_bash=True,
         action_mode="all", plan_size=args.analyzer_interval,
         allow_self_read=False, model=args.analyzer_model,

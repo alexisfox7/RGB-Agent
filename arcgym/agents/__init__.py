@@ -1,14 +1,14 @@
 """ArcGym agent package."""
 
-from .claude_code_action_agent import ClaudeCodeActionAgent
-from .rgb_agent import RGBAgent
+from .rgb_agent import RGBAgent, QueueExhausted, ActionQueue
 
 AVAILABLE_AGENTS = {
-    "claude_code_action_agent": ClaudeCodeActionAgent,
+    "rgb_agent": RGBAgent,
 }
 
 __all__ = [
-    "ClaudeCodeActionAgent",
     "RGBAgent",
+    "QueueExhausted",
+    "ActionQueue",
     "AVAILABLE_AGENTS",
 ]
