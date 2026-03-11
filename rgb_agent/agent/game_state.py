@@ -1,13 +1,15 @@
-"""Base agent class for ARC-AGI-3."""
+"""GameState: grid processing, step history, state-action memory, and log formatting."""
 from __future__ import annotations
 
+import json
 import logging
+import uuid
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
-from arcgym.core import BaseAgent, Step, Trajectory
 from arcengine import GameAction
-from arcgym.utils.grid_utils import (
+from rgb_agent.utils.grid_utils import (
     compute_grid_diff,
     format_grid_ascii,
     get_click_info,
@@ -17,49 +19,63 @@ from arcgym.utils.grid_utils import (
 log = logging.getLogger(__name__)
 
 
-class BaseArcAgent(BaseAgent):
-    """Two-phase agent (observation then action) with rolling context window."""
+@dataclass
+class Step:
+    observation: Any = None
+    action: Any = None
+    model_response: str = ""
+    chat_completions: list[dict[str, str]] = field(default_factory=list)
+    reward: float = 0.0
+    done: bool = False
+    info: dict = field(default_factory=dict)
+
+
+@dataclass
+class Trajectory:
+    uid: str = field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = "agent"
+    steps: list[Step] = field(default_factory=list)
+
+
+class GameState:
+    """Tracks game state and formats the prompt log that the analyzer agent reads."""
 
     def __init__(
         self,
         *,
-        name: str = "base_arc_agent",
+        name: str = "rgb_agent",
         game_id: str | None = None,
         context_window_size: int = 5,
         show_tried_actions: bool = True,
         include_strategy_in_context: bool = False,
+        **_: Any,
     ) -> None:
         self.name = name
+        self.game_id = game_id
         self.context_window_size = context_window_size
         self.show_tried_actions = show_tried_actions
         self.include_strategy_in_context = include_strategy_in_context
-        self.game_id = game_id
 
         self._step_history: deque = deque(maxlen=self.context_window_size)
         self._state_action_memory: dict[str, dict[str, dict[str, Any]]] = {}
         self.reset()
 
-
     def reset(self) -> None:
-        self._trajectory = Trajectory(name=self.name)
-        self._last_observation: dict[str, Any] | None = None
-        self._action_counter: int = 0
-        self._pending_action: dict[str, Any] | None = None
+        self.trajectory = Trajectory(name=self.name)
+        self.last_observation: dict[str, Any] | None = None
+        self.action_counter: int = 0
+        self.last_executed_action: str | None = None
         self._step_history = deque(maxlen=self.context_window_size)
+        self._state_action_memory = {}
+        self._external_hint: str | None = None
+        self._persistent_hint: str | None = None
+        self._pending_state_action: dict | None = None
         self._last_observation_prompt: str = ""
         self._last_observation_response: str = ""
         self._last_action_prompt: str = ""
         self._last_action_response: str = ""
-        self._state_action_memory = {}
-        self._last_executed_action: str | None = None
-        self._pending_state_action: dict | None = None
-        self._external_hint: str | None = None
-        self._persistent_hint: str | None = None
 
-    @property
-    def trajectory(self) -> Trajectory:
-        return self._trajectory
-
+    # --- Hints (set by runner from analyzer output) ---
 
     def set_external_hint(self, hint: str) -> None:
         """One-shot strategic hint for the next observation prompt."""
@@ -70,15 +86,18 @@ class BaseArcAgent(BaseAgent):
         """Short plan that persists on every prompt until the next analysis."""
         self._persistent_hint = plan
 
+    # --- Grid processing ---
 
-    def _format_grid(self, grid: list[list[int]]) -> str:
-        return format_grid_ascii(grid)
-
-    def _process_frame(self, obs: dict) -> tuple[list[list[int]], str]:
+    def process_frame(self, obs: dict) -> tuple[list[list[int]], str]:
         frame_3d = obs.get("frame", [])
         grid_raw = [list(row) for row in frame_3d[-1]] if frame_3d else []
-        return grid_raw, self._format_grid(grid_raw) if grid_raw else ""
+        return grid_raw, format_grid_ascii(grid_raw) if grid_raw else ""
 
+    def render_board(self) -> str | None:
+        _, grid_text = self.process_frame(self.last_observation or {})
+        return grid_text or None
+
+    # --- State-action memory ---
 
     def _record_state_action(self, state_hash: str, action_key: str, result: dict[str, Any]) -> None:
         self._state_action_memory.setdefault(state_hash, {})[action_key] = result
@@ -86,7 +105,7 @@ class BaseArcAgent(BaseAgent):
     def _get_tried_actions(self, state_hash: str) -> dict[str, dict[str, Any]]:
         return self._state_action_memory.get(state_hash, {})
 
-    def _format_state_action_context(self, grid: list[list[int]]) -> str:
+    def format_state_action_context(self, grid: list[list[int]]) -> str:
         if not self.show_tried_actions:
             return ""
         tried = self._get_tried_actions(hash_grid_state(grid))
@@ -103,8 +122,9 @@ class BaseArcAgent(BaseAgent):
         lines.append("")
         return "\n".join(lines)
 
+    # --- Step history ---
 
-    def _format_step_history(self, include_strategy: bool = True) -> str:
+    def format_step_history(self, include_strategy: bool = True) -> str:
         if not self._step_history:
             return ""
         lines = ["**Recent History:**\n"]
@@ -124,9 +144,46 @@ class BaseArcAgent(BaseAgent):
             lines.append(text)
         return "\n".join(lines) + "\n"
 
+    # --- Build observation context (for prompt log) ---
 
-    def update_from_env(self, observation: Any, reward: float, done: bool, info: dict = None, **_: Any) -> None:
-        self._last_observation = observation
+    def build_observation_context(
+        self, grid: str, score: int, grid_raw: list, *, use_queued: bool, queue: Any,
+    ) -> str:
+        history = self.format_step_history()
+        tried = self.format_state_action_context(grid_raw)
+
+        hint_block = ""
+        if self._external_hint:
+            hint_block = f"\n[STRATEGIC ANALYSIS FROM LOG REVIEW]\n{self._external_hint}\n"
+            self._external_hint = None
+        elif self._persistent_hint:
+            hint_block = f"\n[CURRENT PLAN]\n{self._persistent_hint}\n"
+
+        context = (
+            f"{hint_block}"
+            f"{history}"
+            f"{tried}"
+            f"**Current State:**\n"
+            f"Score: {score}\n"
+            f"Step: {self.action_counter}\n\n"
+            f"**Current Matrix** 64x64 (ASCII characters):\n{grid}\n"
+        )
+
+        if use_queued:
+            label = f"step {queue.plan_index + 1}/{queue.plan_total}"
+            context += f"\n[Executing pre-planned action ({label}) — no model call]\n"
+            self._last_observation_prompt = f"[Queued plan {label}]\n\n{context}"
+            self._last_observation_response = f"[Pre-planned action {label}]"
+        else:
+            self._last_observation_prompt = f"[Observation context]\n\n{context}"
+            self._last_observation_response = "[Observation model — context assembled]"
+
+        return context
+
+    # --- Record environment update ---
+
+    def record_env_update(self, observation: Any, reward: float, done: bool, info: dict = None) -> None:
+        self.last_observation = observation
 
         prompts = []
         if self._last_observation_prompt:
@@ -139,10 +196,10 @@ class BaseArcAgent(BaseAgent):
             prompts.append({"role": "action_response", "content": self._last_action_response})
 
         step = Step(observation=observation, reward=reward, done=done, info=info, chat_completions=prompts)
-        self._trajectory.steps.append(step)
+        self.trajectory.steps.append(step)
 
         if self._step_history:
-            grid_raw, _ = self._process_frame(observation)
+            grid_raw, _ = self.process_frame(observation)
             pre_grid = self._step_history[-1].get("grid_raw", [])
             no_change = (pre_grid == grid_raw)
             self._step_history[-1]["no_state_change"] = no_change
@@ -159,17 +216,19 @@ class BaseArcAgent(BaseAgent):
                 )
                 self._pending_state_action = None
 
-    def update_from_model(self, action_payload: dict | None = None, **_: Any) -> dict:
-        action_dict = action_payload or self._pending_action
+    # --- Record model/action update ---
+
+    def record_action(self, action_dict: dict) -> dict:
+        """Record an action and return the GameAction-based result for env.step()."""
         obs_text = action_dict.get("obs_text", "")
         response_text = f"Observation: {obs_text}\nAction: {action_dict['name']}"
 
-        if self._trajectory.steps:
-            self._trajectory.steps[-1].model_response = response_text
-            self._trajectory.steps[-1].action = action_dict
+        if self.trajectory.steps:
+            self.trajectory.steps[-1].model_response = response_text
+            self.trajectory.steps[-1].action = action_dict
 
-        obs = self._last_observation or {}
-        grid_raw, _ = self._process_frame(obs)
+        obs = self.last_observation or {}
+        grid_raw, _ = self.process_frame(obs)
         action_name = action_dict["name"]
 
         if action_name == "ACTION6":
@@ -191,7 +250,7 @@ class BaseArcAgent(BaseAgent):
             }
 
         self._step_history.append({
-            "step": self._action_counter,
+            "step": self.action_counter,
             "action": action_display,
             "score": obs.get("score", 0),
             "state": obs.get("state", "UNKNOWN"),
@@ -200,9 +259,8 @@ class BaseArcAgent(BaseAgent):
             "obs_response": self._last_observation_response if self.include_strategy_in_context else "",
         })
 
-        self._action_counter += 1
-        self._pending_action = None
-        self._last_executed_action = action_name
+        self.action_counter += 1
+        self.last_executed_action = action_name
 
         action = GameAction.from_name(action_name)
         result = {"action": action, "reasoning": response_text}
@@ -212,28 +270,3 @@ class BaseArcAgent(BaseAgent):
             result["x"] = y_pos
             result["y"] = x_pos
         return result
-
-    async def call_llm(self) -> dict:
-        obs = self._last_observation or {}
-        state = obs.get("state", "NOT_PLAYED")
-
-        # Auto-reset on game over
-        if state in ("NOT_PLAYED", "GAME_OVER") and self._last_executed_action != "RESET":
-            action_dict = {"name": "RESET", "data": {}, "obs_text": "Game Over, starting new game.", "action_text": ""}
-            self._pending_action = action_dict
-            return action_dict
-
-        grid_raw, grid_text = self._process_frame(obs)
-        score = obs.get("score", 0)
-
-        obs_text = await self._call_observation_model(grid_text, score, grid_raw)
-        action_dict = await self._call_action_model(grid_text, obs_text)
-        action_dict["obs_text"] = obs_text
-        self._pending_action = action_dict
-        return action_dict
-
-    async def _call_observation_model(self, grid: str, score: int, grid_raw: list) -> str:
-        raise NotImplementedError
-
-    async def _call_action_model(self, grid: str, last_obs: str) -> dict:
-        raise NotImplementedError

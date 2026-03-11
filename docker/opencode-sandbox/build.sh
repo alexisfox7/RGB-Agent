@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
-docker build -t arcgym/opencode-sandbox:latest .
+docker build -t rgb-agent/opencode-sandbox:latest .

@@ -1,4 +1,4 @@
-"""Planner: runs OpenCode in Docker to produce action plans."""
+"""OpenCodeAgent: runs OpenCode in a sandboxed Docker container to produce action plans."""
 from __future__ import annotations
 
 import atexit
@@ -13,9 +13,9 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, IO, Literal, Optional
+from typing import IO, Literal, Optional
 
-from arcgym.agents.prompts import (
+from rgb_agent.agent.prompts import (
     INITIAL_PROMPT,
     RESUME_PROMPT,
     ACTIONS_ADDENDUM,
@@ -24,7 +24,7 @@ from arcgym.agents.prompts import (
 
 log = logging.getLogger(__name__)
 
-_DOCKER_IMAGE = os.environ.get("OPENCODE_DOCKER_IMAGE", "arcgym/opencode-sandbox:latest")
+_DOCKER_IMAGE = os.environ.get("OPENCODE_DOCKER_IMAGE", "rgb-agent/opencode-sandbox:latest")
 
 
 def _docker_image_exists(image: str) -> bool:
@@ -39,7 +39,7 @@ def _docker_image_exists(image: str) -> bool:
 
 
 class _EventStreamParser:
-    """Parses nd-JSON events from opencode and writes to an analyzer log."""
+    """Parses nd-JSON events from OpenCode and writes to an analyzer log."""
 
     def __init__(self, f: IO[str]):
         self._f = f
@@ -243,93 +243,105 @@ class _ContainerPool:
             self._containers.clear()
 
 
-def make_analyzer(
-    interval: int = 5,
-    timeout: Optional[int] = None,
-    use_subscription: bool = False,
-    allow_bash: bool = False,
-    action_mode: Optional[Literal["move", "click", "all"]] = None,
-    plan_size: int = 5,
-    allow_self_read: bool = False,
-    model: str = "claude-opus-4-6",
-    fast: bool = False,
-    resume_session: bool = False,
-) -> Callable[[Path, int], Optional[str]]:
-    """Returns a hook: hook(log_path, action_num, retry_nudge="") -> hint | None"""
-    if not shutil.which("docker"):
-        raise FileNotFoundError("'docker' CLI not found. Install Docker Desktop to use the analyzer.")
-    if not _docker_image_exists(_DOCKER_IMAGE):
-        raise FileNotFoundError(
-            f"Docker image '{_DOCKER_IMAGE}' not found. Build with:\n"
-            f"  cd docker/opencode-sandbox && bash build.sh"
-        )
-    log.info("using Docker sandbox: %s", _DOCKER_IMAGE)
+class OpenCodeAgent:
+    """Runs OpenCode in a sandboxed Docker container to analyze game logs and produce action plans."""
 
-    oc_model = model if "/" in model else f"anthropic/{model}"
-    oc_provider = oc_model.split("/")[0]
+    def __init__(
+        self,
+        *,
+        model: str = "claude-opus-4-6",
+        interval: int = 0,
+        timeout: Optional[int] = None,
+        allow_bash: bool = True,
+        action_mode: Optional[Literal["move", "click", "all"]] = "all",
+        plan_size: int = 5,
+        allow_self_read: bool = False,
+        fast: bool = False,
+        resume_session: bool = True,
+    ) -> None:
+        if not shutil.which("docker"):
+            raise FileNotFoundError("'docker' CLI not found. Install Docker Desktop to use the analyzer.")
+        if not _docker_image_exists(_DOCKER_IMAGE):
+            raise FileNotFoundError(
+                f"Docker image '{_DOCKER_IMAGE}' not found. Build with:\n"
+                f"  cd docker/opencode-sandbox && bash build.sh"
+            )
+        log.info("using Docker sandbox: %s", _DOCKER_IMAGE)
 
-    permission: dict = {
-        "*": "deny",
-        "read": "allow",
-        "grep": "allow",
-        "bash": {
+        self._oc_model = model if "/" in model else f"anthropic/{model}"
+        self._interval = interval
+        self._timeout = timeout
+        self._allow_bash = allow_bash
+        self._action_mode = action_mode
+        self._plan_size = plan_size
+        self._allow_self_read = allow_self_read
+        self._fast = fast
+        self._resume_session = resume_session
+
+        oc_provider = self._oc_model.split("/")[0]
+
+        permission: dict = {
             "*": "deny",
-            "python3 *": "allow",
-            "python *": "allow",
-        } if allow_bash else "deny",
-        "external_directory": "deny",
-        "doom_loop": "allow",
-        "question": "deny",
-        "edit": "deny",
-        "write": "deny",
-        "patch": "deny",
-        "glob": "deny",
-        "list": "deny",
-        "lsp": "deny",
-        "skill": "deny",
-        "webfetch": "deny",
-        "websearch": "deny",
-        "todowrite": "deny",
-        "todoread": "deny",
-    }
+            "read": "allow",
+            "grep": "allow",
+            "bash": {
+                "*": "deny",
+                "python3 *": "allow",
+                "python *": "allow",
+            } if allow_bash else "deny",
+            "external_directory": "deny",
+            "doom_loop": "allow",
+            "question": "deny",
+            "edit": "deny",
+            "write": "deny",
+            "patch": "deny",
+            "glob": "deny",
+            "list": "deny",
+            "lsp": "deny",
+            "skill": "deny",
+            "webfetch": "deny",
+            "websearch": "deny",
+            "todowrite": "deny",
+            "todoread": "deny",
+        }
 
-    config = {
-        "model": oc_model,
-        "provider": {oc_provider: {}},
-        "permission": permission,
-        "agent": {"build": {"steps": 50}},
-    }
+        config = {
+            "model": self._oc_model,
+            "provider": {oc_provider: {}},
+            "permission": permission,
+            "agent": {"build": {"steps": 50}},
+        }
 
-    config_dir = tempfile.mkdtemp(prefix="opencode_analyzer_")
-    config_path = Path(config_dir) / "opencode.json"
-    config_path.write_text(json.dumps(config, indent=2))
-    atexit.register(shutil.rmtree, config_dir, True)
+        config_dir = tempfile.mkdtemp(prefix="opencode_analyzer_")
+        config_path = Path(config_dir) / "opencode.json"
+        config_path.write_text(json.dumps(config, indent=2))
+        atexit.register(shutil.rmtree, config_dir, True)
 
-    pool = _ContainerPool(config_path, permission, _DOCKER_IMAGE, f"oc_sandbox_{uuid.uuid4().hex[:8]}_")
-    atexit.register(pool.cleanup)
+        self._pool = _ContainerPool(config_path, permission, _DOCKER_IMAGE, f"oc_sandbox_{uuid.uuid4().hex[:8]}_")
+        atexit.register(self._pool.cleanup)
 
-    session_ids: dict[str, str] = {}
-    session_lock = threading.Lock()
+        self._session_ids: dict[str, str] = {}
+        self._session_lock = threading.Lock()
 
-    def _build_prompt(log_name: str, analyzer_log_name: str, analyzer_log_exists: bool,
-                      is_first: bool) -> str:
-        if resume_session and not is_first:
+    def _build_prompt(self, log_name: str, analyzer_log_name: str,
+                      analyzer_log_exists: bool, is_first: bool) -> str:
+        if self._resume_session and not is_first:
             prompt = RESUME_PROMPT.format(log_path=log_name)
         else:
             prompt = INITIAL_PROMPT.format(log_path=log_name)
-            if allow_self_read and analyzer_log_exists:
+            if self._allow_self_read and analyzer_log_exists:
                 prompt += (
                     f"\n\nYour previous analysis output is at: {analyzer_log_name}\n"
                     "Read it to see what you concluded last time and build on it. "
                     "Avoid repeating strategies that didn't work."
                 )
-        if allow_bash:
+        if self._allow_bash:
             prompt += PYTHON_ADDENDUM.format(log_path=log_name)
-        if action_mode:
-            prompt += ACTIONS_ADDENDUM.format(plan_size=plan_size)
+        if self._action_mode:
+            prompt += ACTIONS_ADDENDUM.format(plan_size=self._plan_size)
         return prompt
 
-    def _try_recover_text(container_name: str, sid: str, sandbox_dir: str) -> str:
+    def _try_recover_text(self, container_name: str, sid: str, sandbox_dir: str) -> str:
         export_path = Path(sandbox_dir) / "_export.json"
         try:
             subprocess.run(
@@ -358,8 +370,9 @@ def make_analyzer(
             log.debug("export recovery failed: %s", e)
             return ""
 
-    def hook(log_path: Path, action_num: int, retry_nudge: str = "") -> Optional[str]:
-        if interval > 0 and action_num % interval != 0:
+    def analyze(self, log_path: Path, action_num: int, retry_nudge: str = "") -> Optional[str]:
+        """Analyze the game log and return the agent's response text, or None on failure."""
+        if self._interval > 0 and action_num % self._interval != 0:
             return None
         if not log_path.exists():
             return None
@@ -369,35 +382,35 @@ def make_analyzer(
 
         is_first = True
         current_sid = None
-        if resume_session:
-            with session_lock:
-                if path_key in session_ids:
-                    current_sid = session_ids[path_key]
+        if self._resume_session:
+            with self._session_lock:
+                if path_key in self._session_ids:
+                    current_sid = self._session_ids[path_key]
                     is_first = False
 
-        container_name, server_port, sandbox_dir = pool.get(path_key)
+        container_name, server_port, sandbox_dir = self._pool.get(path_key)
         sandbox = Path(sandbox_dir)
 
         try:
             shutil.copy2(log_path, sandbox / log_path.name)
-            if allow_self_read and analyzer_log.exists():
+            if self._allow_self_read and analyzer_log.exists():
                 shutil.copy2(analyzer_log, sandbox / analyzer_log.name)
 
-            prompt = _build_prompt(log_path.name, analyzer_log.name, analyzer_log.exists(), is_first)
+            prompt = self._build_prompt(log_path.name, analyzer_log.name, analyzer_log.exists(), is_first)
             if retry_nudge:
                 prompt += f"\n\n{retry_nudge}"
 
             oc_args = ["run", "--attach", f"http://127.0.0.1:{server_port}"]
-            if resume_session and not is_first and current_sid:
+            if self._resume_session and not is_first and current_sid:
                 oc_args.extend(["--session", current_sid, "--continue"])
-            oc_args.extend(["--model", oc_model])
-            if fast:
+            oc_args.extend(["--model", self._oc_model])
+            if self._fast:
                 oc_args.extend(["--variant", "minimal"])
             oc_args.extend(["--format", "json", "--dir", "/workspace"])
             oc_args.append(prompt)
 
             cmd = ["docker", "exec", container_name, "opencode", *oc_args]
-            log.info("exec %s model=%s%s", container_name, oc_model,
+            log.info("exec %s model=%s%s", container_name, self._oc_model,
                      f" session={current_sid}" if current_sid else "")
 
             proc = subprocess.Popen(
@@ -417,12 +430,12 @@ def make_analyzer(
 
             with open(analyzer_log, "a", encoding="utf-8") as f:
                 f.write(f"\n--- action={action_num} | {datetime.now().strftime('%H:%M:%S')} | opencode ---\n")
-                if is_first or not resume_session:
+                if is_first or not self._resume_session:
                     f.write(f"[SYSTEM PROMPT]\n{prompt}\n\n")
                 f.flush()
 
                 parser = _EventStreamParser(f)
-                deadline = time.monotonic() + timeout if timeout is not None else None
+                deadline = time.monotonic() + self._timeout if self._timeout is not None else None
 
                 while True:
                     line = proc.stdout.readline()
@@ -451,18 +464,18 @@ def make_analyzer(
 
                 needs_recovery = (
                     not parser.accumulated_text.strip()
-                    or (action_mode and "[ACTIONS]" not in parser.accumulated_text)
+                    or (self._action_mode and "[ACTIONS]" not in parser.accumulated_text)
                 )
                 if needs_recovery and parser.session_id:
-                    recovered = _try_recover_text(container_name, parser.session_id, sandbox_dir)
+                    recovered = self._try_recover_text(container_name, parser.session_id, sandbox_dir)
                     if recovered:
                         parser.accumulated_text = recovered
                         log.info("recovered %d chars via session export", len(recovered))
 
-                if resume_session and parser.session_id is None and not is_first:
+                if self._resume_session and parser.session_id is None and not is_first:
                     log.warning("context overflow — clearing session for %s", path_key)
-                    with session_lock:
-                        session_ids.pop(path_key, None)
+                    with self._session_lock:
+                        self._session_ids.pop(path_key, None)
 
                 f.flush()
 
@@ -471,14 +484,14 @@ def make_analyzer(
             if proc.returncode != 0 or not hint:
                 log.warning("action=%d failed: rc=%d, hint_len=%d",
                             action_num, proc.returncode, len(hint) if hint else 0)
-                if resume_session:
-                    with session_lock:
-                        session_ids.pop(path_key, None)
+                if self._resume_session:
+                    with self._session_lock:
+                        self._session_ids.pop(path_key, None)
                 return None
 
-            if resume_session and parser.session_id:
-                with session_lock:
-                    session_ids[path_key] = parser.session_id
+            if self._resume_session and parser.session_id:
+                with self._session_lock:
+                    self._session_ids[path_key] = parser.session_id
 
             log.info("action=%d OK (%d chars)", action_num, len(hint))
             return hint
@@ -486,5 +499,3 @@ def make_analyzer(
         except Exception as e:
             log.error("unexpected error: %s", e, exc_info=True)
             return None
-
-    return hook

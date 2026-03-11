@@ -1,4 +1,4 @@
-"""Prompt templates for the planner."""
+"""Prompt templates for the analyzer agent."""
 
 INITIAL_PROMPT = """\
 You are a strategic advisor for an AI agent playing a grid-based puzzle game.

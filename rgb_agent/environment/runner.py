@@ -1,5 +1,5 @@
-"""Game loop that drives an RGBAgent through an ARC-AGI-3 environment."""
-import asyncio
+"""Game loop that drives the action queue through an ARC-AGI-3 environment."""
+import json
 import logging
 import os
 import sys
@@ -9,10 +9,10 @@ from typing import Any, Callable, Optional
 
 import requests
 
-from arcgym.agents.rgb_agent import RGBAgent, QueueExhausted
-from arcgym.environments import ArcAgi3Env
-from arcengine import GameState
-from arcgym.metrics.structures import GameMetrics, LevelMetrics, AttemptMetrics, Status
+from rgb_agent.agent import GameState, ActionQueue, QueueExhausted
+from rgb_agent.environment import ArcAgi3Env
+from arcengine import GameState as ArcGameState
+from rgb_agent.metrics.structures import GameMetrics, LevelMetrics, AttemptMetrics, Status
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def _run_with_retries(func: Callable, *args: Any, **kwargs: Any) -> Any:
 
 
 class GameRunner:
-    """Runs an RGBAgent through a game, collecting metrics."""
+    """Runs a game by orchestrating GameState, ActionQueue, and the analyzer agent."""
 
     def __init__(
         self,
@@ -72,7 +72,46 @@ class GameRunner:
         self.analyzer = analyzer
         self.log_post_board = log_post_board
         self.analyzer_retries = analyzer_retries
-        self._agent = RGBAgent(**(agent_kwargs or {}))
+        self._state = GameState(**(agent_kwargs or {}))
+        self._queue = ActionQueue()
+
+    def _next_action(self) -> dict:
+        """Get the next action: auto-reset, queue drain, or raise QueueExhausted."""
+        obs = self._state.last_observation or {}
+        state = obs.get("state", "NOT_PLAYED")
+
+        # Auto-reset on game over
+        if state in ("NOT_PLAYED", "GAME_OVER") and self._state.last_executed_action != "RESET":
+            return {"name": "RESET", "data": {}, "obs_text": "Game Over, starting new game.", "action_text": ""}
+
+        grid_raw, grid_text = self._state.process_frame(obs)
+        score = obs.get("score", 0)
+
+        use_queued = bool(self._queue and not self._queue.score_changed)
+        if not use_queued:
+            self._queue.score_changed = False
+
+        self._state.build_observation_context(
+            grid_text, score, grid_raw, use_queued=use_queued, queue=self._queue,
+        )
+
+        if use_queued and self._queue:
+            action = self._queue.pop()
+            label = f"plan step {self._queue.plan_index}/{self._queue.plan_total}"
+            action["obs_text"] = ""
+            action["action_text"] = f"[queued {label}]"
+
+            self._state._last_action_prompt = f"[Queued {label} — no model call]"
+            self._state._last_action_response = (
+                f"Tool Call: {action['name']}({json.dumps(action['data'])})\n"
+                f"Content: Executing pre-planned action ({label})"
+            )
+            log.info("queue drain -> %s (%s, %d remaining)",
+                     action.get("name"), label, len(self._queue))
+            return action
+
+        log.info("queue empty — need new plan from analyzer")
+        raise QueueExhausted("Queue empty, no actions from analyzer")
 
     def run(self) -> GameMetrics:
         metrics = GameMetrics(
@@ -91,20 +130,19 @@ class GameRunner:
 
         max_score = 0
         total_actions = 0
-        arc_state: GameState | None = None
+        arc_state: ArcGameState | None = None
         arc_score = 0
 
-        loop = asyncio.new_event_loop()
-
         try:
-            self._agent.reset()
+            self._state.reset()
+            self._queue.reset()
 
             # Initial reset
             observation = _run_with_retries(
                 self.env.reset,
                 task={"game_id": self.game_id, "max_actions": self.max_actions_per_game, "tags": self.tags},
             )
-            arc_state = GameState[observation.get("state") or "NOT_PLAYED"]
+            arc_state = ArcGameState[observation.get("state") or "NOT_PLAYED"]
             arc_score = observation.get("score", 0) or 0
 
             guid = observation.get("guid")
@@ -122,11 +160,11 @@ class GameRunner:
                         f"command: {Path(sys.argv[0]).name} {' '.join(sys.argv[1:])}\n"
                     )
 
-            self._agent.update_from_env(observation=observation, reward=0.0, done=False)
+            self._state.record_env_update(observation=observation, reward=0.0, done=False)
 
             # Log initial board
             if self.prompts_log_path:
-                grid = self._agent.render_board()
+                grid = self._state.render_board()
                 if grid:
                     with open(self.prompts_log_path, 'a', encoding='utf-8') as f:
                         f.write(f"\n{'='*80}\n")
@@ -138,7 +176,7 @@ class GameRunner:
             # Main game loop
             while total_actions < self.max_actions_per_game:
                 try:
-                    action_dict = loop.run_until_complete(self._agent.call_llm())
+                    action_dict = self._next_action()
                 except QueueExhausted:
                     log.info("queue exhausted at action %d — firing analyzer", total_actions)
                     loaded = False
@@ -152,32 +190,33 @@ class GameRunner:
                         log.warning("analyzer attempt %d/%d failed", attempt + 1, self.analyzer_retries)
                     if not loaded:
                         raise
-                    action_dict = loop.run_until_complete(self._agent.call_llm())
+                    action_dict = self._next_action()
 
-                action_obj = self._agent.update_from_model()
-                observation, reward, done = _run_with_retries(self.env.step, action_obj)
+                action_result = self._state.record_action(action_dict)
+                observation, reward, done = _run_with_retries(self.env.step, action_result)
 
                 total_actions += 1
                 attempt_metrics.actions += 1
 
                 prev_score = arc_score
-                arc_state = GameState[observation.get("state") or "NOT_PLAYED"]
+                arc_state = ArcGameState[observation.get("state") or "NOT_PLAYED"]
                 arc_score = observation.get("score", 0) or 0
                 max_score = max(max_score, arc_score)
                 metrics.highest_level_reached = max(metrics.highest_level_reached, level_num)
 
-                self._agent.update_from_env(observation=observation, reward=reward, done=done)
+                self._state.record_env_update(observation=observation, reward=reward, done=done)
+                self._queue.check_score(arc_score)
 
                 self._log_action(total_actions, level_num, attempt_num, arc_score, arc_state)
 
                 if self.log_post_board and self.prompts_log_path:
-                    grid = self._agent.render_board()
+                    grid = self._state.render_board()
                     if grid:
                         with open(self.prompts_log_path, 'a', encoding='utf-8') as f:
                             f.write(f"[POST-ACTION BOARD STATE]\nScore: {arc_score}\n{grid}\n\n")
 
                 # Level completed
-                if arc_score > prev_score and arc_state not in (GameState.WIN, GameState.GAME_OVER):
+                if arc_score > prev_score and arc_state not in (ArcGameState.WIN, ArcGameState.GAME_OVER):
                     attempt_metrics.duration_seconds = time.time() - attempt_start
                     attempt_metrics.status = Status.COMPLETED
                     level_metrics.attempts.append(attempt_metrics)
@@ -195,7 +234,7 @@ class GameRunner:
                     attempt_start = time.time()
                     continue
 
-                if arc_state == GameState.GAME_OVER:
+                if arc_state == ArcGameState.GAME_OVER:
                     attempt_metrics.duration_seconds = time.time() - attempt_start
                     attempt_metrics.status = Status.GAME_OVER
                     attempt_metrics.game_overs += 1
@@ -209,7 +248,7 @@ class GameRunner:
                     attempt_metrics = AttemptMetrics(attempt_number=attempt_num)
                     attempt_start = time.time()
 
-                if arc_state == GameState.WIN:
+                if arc_state == ArcGameState.WIN:
                     attempt_metrics.duration_seconds = time.time() - attempt_start
                     attempt_metrics.status = Status.COMPLETED
                     level_metrics.attempts.append(attempt_metrics)
@@ -239,7 +278,7 @@ class GameRunner:
                 attempt_metrics.duration_seconds = metrics.end_time - attempt_start
                 if metrics.status == Status.ERROR:
                     attempt_metrics.status = Status.ERROR
-                elif arc_state == GameState.WIN:
+                elif arc_state == ArcGameState.WIN:
                     attempt_metrics.status = Status.COMPLETED
                     metrics.status = Status.COMPLETED_RUN
                 else:
@@ -262,16 +301,13 @@ class GameRunner:
             if metrics.guid and not metrics.replay_url:
                 metrics.replay_url = f"{ROOT_URL}/replay/{self.game_id}/{metrics.guid}"
 
-            loop.close()
-
         return metrics
-
 
     def _fire_analyzer(self, action_num: int, arc_score: int, retry_nudge: str = "") -> bool:
         if not self.analyzer:
             return False
         if self.prompts_log_path and not self.log_post_board:
-            grid = self._agent.render_board()
+            grid = self._state.render_board()
             if grid:
                 with open(self.prompts_log_path, 'a', encoding='utf-8') as f:
                     f.write(f"[POST-ACTION BOARD STATE]\nScore: {arc_score}\n{grid}\n\n")
@@ -294,11 +330,11 @@ class GameRunner:
         else:
             full_hint = plan = hint
 
-        self._agent.set_external_hint(full_hint)
-        self._agent.set_persistent_hint(plan)
+        self._state.set_external_hint(full_hint)
+        self._state.set_persistent_hint(plan)
 
         if actions_text:
-            if self._agent.set_action_plan(actions_text):
+            if self._queue.load(actions_text):
                 log.info("analyzer at action %d: loaded action plan (%d chars)", action_num, len(actions_text))
                 return True
             log.warning("analyzer at action %d: set_action_plan rejected the plan", action_num)
@@ -308,13 +344,13 @@ class GameRunner:
         return False
 
     def _log_action(self, action_num: int, level: int, attempt: int,
-                    arc_score: int, arc_state: GameState) -> None:
-        if not self.prompts_log_path or not self._agent.trajectory.steps:
+                    arc_score: int, arc_state: ArcGameState) -> None:
+        if not self.prompts_log_path or not self._state.trajectory.steps:
             return
-        last_step = self._agent.trajectory.steps[-1]
+        last_step = self._state.trajectory.steps[-1]
         with open(self.prompts_log_path, 'a', encoding='utf-8') as f:
             f.write(f"\n{'='*80}\n")
-            plan_info = f" | Plan Step {self._agent.plan_index}/{self._agent.plan_total}" if self._agent.plan_total > 0 else ""
+            plan_info = f" | Plan Step {self._queue.plan_index}/{self._queue.plan_total}" if self._queue.plan_total > 0 else ""
             f.write(f"Action {action_num} | Level {level} | Attempt {attempt}{plan_info}\n")
             f.write(f"Score: {arc_score} | State: {arc_state.name}\n")
             f.write(f"{'='*80}\n\n")

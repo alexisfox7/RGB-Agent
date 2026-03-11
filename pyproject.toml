@@ -3,15 +3,15 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "arcgym"
+name = "rgb-agent"
 version = "0.1.0"
-description = "ArcGym extensions that plug into the rLLM agent/environment stack."
+description = "An agent for ARC-AGI-3 that uses Read, Grep, and Bash to solve puzzles."
 readme = "README.md"
 authors = [
-    { name = "ArcGym authors" },
+    { name = "RGB-Agent authors" },
 ]
 requires-python = ">=3.12"
-keywords = ["rl", "language-models", "textarena"]
+keywords = ["arc-agi", "agent", "puzzle-solving"]
 dependencies = [
     "arc-agi>=0.9.1",
     "arcengine>=0.9.3",
@@ -33,9 +33,9 @@ dev = [
 ]
 
 [project.scripts]
-arcgym-swarm = "arcgym.evaluation.swarm:main"
+rgb-swarm = "rgb_agent.environment.swarm:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["arcgym", "arcgym.*"]
+include = ["rgb_agent", "rgb_agent.*"]
 exclude = ["examples*", "rllm*", "Agent_Context*"]

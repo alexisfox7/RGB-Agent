@@ -1,1 +1,0 @@
-"""ArcGym evaluation package."""

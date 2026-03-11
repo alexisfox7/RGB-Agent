@@ -29,8 +29,8 @@ ANTHROPIC_API_KEY=...
 ## Usage
 
 ```bash
-arcgym-swarm --suite all --max-actions 500
-arcgym-swarm --game ls20,ft09
+rgb-swarm --suite all --max-actions 500
+rgb-swarm --game ls20,ft09
 ```
 
 ### Key flags
@@ -40,16 +40,16 @@ arcgym-swarm --game ls20,ft09
 | `--suite` | — | Predefined game suites (e.g. `ls20`, `vc33`, `ft09`, or `all`) |
 | `--game` | — | Comma-separated game names or IDs (alternative to `--suite`) |
 | `--max-actions` | 500 | Max actions per game |
-| `--analyzer-interval` | 10 | Actions per analyzer batch plan |
-| `--analyzer-model` | `claude-opus-4-6` | Analyzer model (see below) |
+| `--interval`, `-n` | 10 | Actions per analyzer batch plan |
+| `--model`, `-m` | `claude-opus-4-6` | Analyzer model (see below) |
 | `--operation-mode` | `online` | `online` / `offline` / `normal` |
 
-### Analyzer models
+### Models
 
 Anthropic models can be passed without a prefix. For other providers, use `provider/model`.
 
-| Model | `--analyzer-model` value |
-|-------|--------------------------|
+| Model | `--model` value |
+|-------|-----------------|
 | Claude Opus 4.6 | `claude-opus-4-6` (default) |
 | Claude Sonnet 4.6 | `claude-sonnet-4-6` |
 | GPT 5.2 | `openai/gpt-5.2` |
@@ -63,15 +63,20 @@ Results are saved to `evaluation_results/`.
 
 ## Architecture
 
-Every N actions, the planner (a coding agent ([OpenCode](https://github.com/opencode-ai/opencode))) running in a sandboxed Docker container reads the agent's prompt log with Read, Grep, and Python, then outputs a JSON action plan. The agent queues these actions and drains them one per step with zero LLM calls. When the queue empties or the score changes, the planner re-fires.
+The analyzer agent ([OpenCode](https://github.com/opencode-ai/opencode)) runs in a sandboxed Docker container, reads the game's prompt log with Read, Grep, and Python, and outputs a JSON action plan. The action queue drains these one per step with zero LLM calls. When the queue empties or the score changes, the analyzer re-fires.
 
 ```
-arcgym/agents/
-├── rgb_agent.py   # Agent + action queue
-├── planner.py     # OpenCode-in-Docker planner
-├── prompts.py     # Planner prompt templates
-arcgym/evaluation/
-├── swarm.py       # CLI entry point
-├── runner.py      # Per-game episode loop
+rgb_agent/
+├── agent/              
+│   ├── opencode_agent.py # Runs OpenCode in Docker to produce action plans
+│   ├── action_queue.py # Drains one action per step (to support batched action plans + score-change flush)
+│   ├── game_state.py   # Formatting
+│   └── prompts.py      
+├── environment/        
+│   ├── arcagi3.py      # ARC-AGI-3 API wrapper (reset, step, scoring)
+│   ├── runner.py       # Per-game orchestration loop
+│   ├── swarm.py        # Runs multiple games in parallel on a scorecard
+│   └── config.py     
+├── metrics/            
+└── utils/            
 ```
-

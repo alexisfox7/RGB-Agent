@@ -1,8 +1,8 @@
 """Run one scorecard across multiple games in parallel threads.
 
 Usage:
-    arcgym-swarm --suite all --max-actions 500
-    arcgym-swarm --game ls20,ft09
+    rgb_agent-swarm --suite all --max-actions 500
+    rgb_agent-swarm --game ls20,ft09
 """
 from __future__ import annotations
 
@@ -24,12 +24,11 @@ from dotenv import load_dotenv
 import arc_agi
 from arc_agi import OperationMode
 
-from arcgym.agents import AVAILABLE_AGENTS
-from arcgym.evaluation.runner import GameRunner
-from arcgym.environments import ArcAgi3Env
-from arcgym.evaluation.config import EVALUATION_GAMES
-from arcgym.metrics.structures import GameMetrics, Status
-from arcgym.metrics.reporting import generate_console_report, save_summary_report, calculate_stats
+from rgb_agent.environment.runner import GameRunner
+from rgb_agent.environment import ArcAgi3Env
+from rgb_agent.environment.config import EVALUATION_GAMES
+from rgb_agent.metrics.structures import GameMetrics, Status
+from rgb_agent.metrics.reporting import generate_console_report, save_summary_report, calculate_stats
 
 log = logging.getLogger(__name__)
 
@@ -142,17 +141,19 @@ def main() -> None:
     logging.getLogger("arc_agi").propagate = False
 
     parser = argparse.ArgumentParser(description="Run ARC-AGI-3 Swarm evaluation.")
-    parser.add_argument("--agent", "-a", default="rgb_agent",
-                        choices=list(AVAILABLE_AGENTS.keys()))
+    parser.add_argument("--agent", "-a", default="rgb_agent")
     parser.add_argument("--game", "-g",
                         help="Comma-separated game IDs (e.g. ls20-cb3b57cc,ft09-9ab2447a).")
     parser.add_argument("--suite", "-s", choices=list(EVALUATION_GAMES.keys()))
     parser.add_argument("--tags", "-t", help="Comma-separated tags.")
     parser.add_argument("--max-actions", type=int, default=500)
     parser.add_argument("--operation-mode", default="online", choices=["normal", "online", "offline"])
-    parser.add_argument("--analyzer-interval", dest="analyzer_interval", type=int, default=10)
-    parser.add_argument("--analyzer-model", dest="analyzer_model", default="claude-opus-4-6")
-    parser.add_argument("--analyzer-retries", dest="analyzer_retries", type=int, default=5)
+    parser.add_argument("--interval", "-n", dest="analyzer_interval", type=int, default=10,
+                        help="Actions per analyzer batch plan")
+    parser.add_argument("--model", "-m", dest="analyzer_model", default="claude-opus-4-6",
+                        help="Analyzer model")
+    parser.add_argument("--retries", dest="analyzer_retries", type=int, default=5,
+                        help="Max analyzer retry attempts")
 
     args = parser.parse_args()
 
@@ -194,13 +195,11 @@ def main() -> None:
         operation_mode=OperationMode(args.operation_mode),
     )
 
-    from arcgym.agents.planner import make_analyzer
+    from rgb_agent.agent import OpenCodeAgent
 
-    analyzer_hook = make_analyzer(
-        interval=0, use_subscription=False, allow_bash=True,
-        action_mode="all", plan_size=args.analyzer_interval,
-        allow_self_read=False, model=args.analyzer_model,
-        fast=False, resume_session=True,
+    agent = OpenCodeAgent(
+        model=args.analyzer_model,
+        plan_size=args.analyzer_interval,
     )
     log.info("Analyzer enabled (interval=%d, model=%s)", args.analyzer_interval, args.analyzer_model)
 
@@ -217,7 +216,7 @@ def main() -> None:
         inner_agent_kwargs=inner_agent_kwargs,
         arcade=arcade, games=games, tags=tags,
         max_actions=args.max_actions,
-        analyzer_hook=analyzer_hook,
+        analyzer_hook=agent.analyze,
         prompts_log_dir=run_dir,
         log_post_board=True,
         analyzer_retries=args.analyzer_retries,
