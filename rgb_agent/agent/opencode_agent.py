@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Literal, Optional
+from typing import IO, Optional
 
 from rgb_agent.agent.prompts import (
     INITIAL_PROMPT,
@@ -250,13 +250,8 @@ class OpenCodeAgent:
         self,
         *,
         model: str = "claude-opus-4-6",
-        interval: int = 0,
-        timeout: Optional[int] = None,
-        allow_bash: bool = True,
-        action_mode: Optional[Literal["move", "click", "all"]] = "all",
         plan_size: int = 5,
-        allow_self_read: bool = False,
-        fast: bool = False,
+        timeout: Optional[int] = None,
         resume_session: bool = True,
     ) -> None:
         if not shutil.which("docker"):
@@ -269,13 +264,8 @@ class OpenCodeAgent:
         log.info("using Docker sandbox: %s", _DOCKER_IMAGE)
 
         self._oc_model = model if "/" in model else f"anthropic/{model}"
-        self._interval = interval
-        self._timeout = timeout
-        self._allow_bash = allow_bash
-        self._action_mode = action_mode
         self._plan_size = plan_size
-        self._allow_self_read = allow_self_read
-        self._fast = fast
+        self._timeout = timeout
         self._resume_session = resume_session
 
         oc_provider = self._oc_model.split("/")[0]
@@ -288,7 +278,7 @@ class OpenCodeAgent:
                 "*": "deny",
                 "python3 *": "allow",
                 "python *": "allow",
-            } if allow_bash else "deny",
+            },
             "external_directory": "deny",
             "doom_loop": "allow",
             "question": "deny",
@@ -323,22 +313,13 @@ class OpenCodeAgent:
         self._session_ids: dict[str, str] = {}
         self._session_lock = threading.Lock()
 
-    def _build_prompt(self, log_name: str, analyzer_log_name: str,
-                      analyzer_log_exists: bool, is_first: bool) -> str:
+    def _build_prompt(self, log_name: str, is_first: bool) -> str:
         if self._resume_session and not is_first:
             prompt = RESUME_PROMPT.format(log_path=log_name)
         else:
             prompt = INITIAL_PROMPT.format(log_path=log_name)
-            if self._allow_self_read and analyzer_log_exists:
-                prompt += (
-                    f"\n\nYour previous analysis output is at: {analyzer_log_name}\n"
-                    "Read it to see what you concluded last time and build on it. "
-                    "Avoid repeating strategies that didn't work."
-                )
-        if self._allow_bash:
-            prompt += PYTHON_ADDENDUM.format(log_path=log_name)
-        if self._action_mode:
-            prompt += ACTIONS_ADDENDUM.format(plan_size=self._plan_size)
+        prompt += PYTHON_ADDENDUM.format(log_path=log_name)
+        prompt += ACTIONS_ADDENDUM.format(plan_size=self._plan_size)
         return prompt
 
     def _try_recover_text(self, container_name: str, sid: str, sandbox_dir: str) -> str:
@@ -372,8 +353,6 @@ class OpenCodeAgent:
 
     def analyze(self, log_path: Path, action_num: int, retry_nudge: str = "") -> Optional[str]:
         """Analyze the game log and return the agent's response text, or None on failure."""
-        if self._interval > 0 and action_num % self._interval != 0:
-            return None
         if not log_path.exists():
             return None
 
@@ -393,10 +372,8 @@ class OpenCodeAgent:
 
         try:
             shutil.copy2(log_path, sandbox / log_path.name)
-            if self._allow_self_read and analyzer_log.exists():
-                shutil.copy2(analyzer_log, sandbox / analyzer_log.name)
 
-            prompt = self._build_prompt(log_path.name, analyzer_log.name, analyzer_log.exists(), is_first)
+            prompt = self._build_prompt(log_path.name, is_first)
             if retry_nudge:
                 prompt += f"\n\n{retry_nudge}"
 
@@ -404,8 +381,6 @@ class OpenCodeAgent:
             if self._resume_session and not is_first and current_sid:
                 oc_args.extend(["--session", current_sid, "--continue"])
             oc_args.extend(["--model", self._oc_model])
-            if self._fast:
-                oc_args.extend(["--variant", "minimal"])
             oc_args.extend(["--format", "json", "--dir", "/workspace"])
             oc_args.append(prompt)
 
@@ -464,7 +439,7 @@ class OpenCodeAgent:
 
                 needs_recovery = (
                     not parser.accumulated_text.strip()
-                    or (self._action_mode and "[ACTIONS]" not in parser.accumulated_text)
+                    or "[ACTIONS]" not in parser.accumulated_text
                 )
                 if needs_recovery and parser.session_id:
                     recovered = self._try_recover_text(container_name, parser.session_id, sandbox_dir)
