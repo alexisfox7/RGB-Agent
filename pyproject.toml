@@ -15,6 +15,7 @@ keywords = ["arc-agi", "agent", "puzzle-solving"]
 dependencies = [
     "arc-agi>=0.9.1",
     "arcengine>=0.9.3",
+    "claude-agent-sdk",
     "hydra-core>=1.3",
     "pydantic>=2.5",
     "requests>=2.31",

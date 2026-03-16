@@ -188,7 +188,7 @@ class _ContainerPool:
         shutil.copy2(self._config_path, Path(sandbox) / "opencode.json")
 
         env_flags: list[str] = []
-        for key_name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
+        for key_name in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
             val = os.environ.get(key_name)
             if val:
                 env_flags.extend(["-e", f"{key_name}={val}"])

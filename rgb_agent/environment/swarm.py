@@ -154,6 +154,8 @@ def main() -> None:
                         help="Analyzer model")
     parser.add_argument("--retries", dest="analyzer_retries", type=int, default=5,
                         help="Max analyzer retry attempts")
+    parser.add_argument("--no-docker", dest="use_docker", action="store_false", default=True,
+                        help="Disable Docker sandbox (use native sandbox instead)")
 
     args = parser.parse_args()
 
@@ -195,13 +197,15 @@ def main() -> None:
         operation_mode=OperationMode(args.operation_mode),
     )
 
-    from rgb_agent.agent import OpenCodeAgent
+    from rgb_agent.agent import ClaudeAgent
 
-    agent = OpenCodeAgent(
+    agent = ClaudeAgent(
         model=args.analyzer_model,
         plan_size=args.analyzer_interval,
+        use_docker=args.use_docker,
     )
-    log.info("Analyzer enabled (interval=%d, model=%s)", args.analyzer_interval, args.analyzer_model)
+    log.info("Analyzer enabled (interval=%d, model=%s, docker=%s)",
+             args.analyzer_interval, args.analyzer_model, args.use_docker)
 
     timestamp = datetime.now().strftime("%m%dT%H%M%S")
     run_dir = Path("evaluation_results") / f"{timestamp}_swarm_{args.agent}"
